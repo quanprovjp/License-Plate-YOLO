@@ -1,0 +1,238 @@
+import cv2
+import easyocr
+from ultralytics import YOLO
+import time
+import serial
+import threading
+import queue
+from datetime import datetime, timedelta
+import logging
+import os
+
+# Cấu hình logging
+logging.basicConfig(filename='license_plate.log', level=logging.INFO, 
+                    format='%(asctime)s - %(message)s')
+
+license_plate_queue = queue.Queue()
+
+def count_matching_chars(plate1, plate2):
+    plate1 = plate1.lower().replace(" ", "").replace(".", "")
+    plate2 = plate2.lower().replace(" ", "").replace(".", "")
+    set1 = set(plate1)
+    set2 = set(plate2)
+    matching_chars = len(set1.intersection(set2))
+    return matching_chars
+
+def detect_license_plate(camera_id, ser, output_file, is_entry, model, reader):
+    """
+    Hàm xử lý camera, phát hiện biển số, gửi tín hiệu servo không block.
+    Chạy trên thread riêng.
+    """
+    cap = cv2.VideoCapture(camera_id, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        logging.error(f"Không thể mở camera {camera_id}")
+        print(f"Không thể mở camera {camera_id}")
+        return
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+    last_plate_text = ""
+    last_detection_time = 0
+    detection_delay = 0.3
+    plate_detected = False
+    timeout = 30
+    start_time = time.time()
+    process_interval = 0.1
+    last_processed_time = 0
+
+    while time.time() - start_time < timeout:
+        if time.time() - last_processed_time < process_interval:
+            time.sleep(0.01)
+            continue
+        last_processed_time = time.time()
+
+        ret, frame = cap.read()
+        if not ret:
+            logging.error(f"Không thể đọc frame từ camera {camera_id}")
+            print(f"Không thể đọc frame từ camera {camera_id}")
+            break
+
+        results = model(frame, device="cuda")
+        if not results:
+            continue
+
+        for r in results:
+            for box in r.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                conf = box.conf[0]
+                if conf > 0.4:
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    plate = frame[y1:y2, x1:x2]
+                    plate = cv2.resize(plate, (200, 50))
+                    plate_gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY)
+                    plate_gray = cv2.equalizeHist(plate_gray)
+                    text = reader.readtext(plate_gray, detail=0)
+                    if not text:
+                        cv2.putText(frame, "Khong doc duoc bien so", (x1, y1 - 10), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                        continue
+                    plate_text = ' '.join(text).strip()
+                    if plate_text and plate_text != last_plate_text:
+                        last_plate_text = plate_text
+                        last_detection_time = time.time()
+                        plate_detected = True
+                    if plate_text:
+                        cv2.putText(frame, plate_text, (x1, y1 - 10), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        if plate_detected and last_plate_text and (time.time() - last_detection_time) >= detection_delay:
+            logging.info(f"Camera {camera_id} nhận diện biển số: {last_plate_text}")
+            print(f"Camera {camera_id} nhận diện biển số: {last_plate_text}")
+
+            # Ghi file và queue
+            license_plate_queue.put((last_plate_text, datetime.now()))
+            output_file.write(f"{last_plate_text}\n")
+            output_file.flush()
+
+            # Gửi lệnh servo không block
+            if ser and ser.is_open:
+                if is_entry:
+                    send_serial_command(ser, "RUN_SERVO1")
+                else:
+                    # Kiểm tra có biển số trùng khớp
+                    plate_matched = False
+                    temp_queue = queue.Queue()
+                    while not license_plate_queue.empty():
+                        plate, timestamp = license_plate_queue.get()
+                        if datetime.now() - timestamp > timedelta(hours=1):
+                            continue
+                        matching_chars = count_matching_chars(plate, last_plate_text)
+                        if matching_chars >= 4:
+                            logging.info(f"Biển số {last_plate_text} có {matching_chars} ký tự khớp với {plate}, mở barrier")
+                            print(f"Biển số {last_plate_text} có {matching_chars} ký tự khớp với {plate}, mở barrier")
+                            plate_matched = True
+                        else:
+                            temp_queue.put((plate, timestamp))
+                    while not temp_queue.empty():
+                        license_plate_queue.put(temp_queue.get())
+
+                    if plate_matched:
+                        send_serial_command(ser, "RUN_SERVO2")
+                    else:
+                        logging.warning(f"Biển số {last_plate_text} không đủ ký tự khớp")
+                        print(f"Biển số {last_plate_text} không đủ ký tự khớp")
+            
+            break
+
+        cv2.imshow(f"License Plate Detection - Camera {camera_id}", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            print(f"Camera {camera_id}: Người dùng nhấn 'q', thoát vòng lặp")
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+def send_serial_command(ser, command, wait_response=True, timeout=5):
+    """
+    Gửi lệnh qua Serial và đợi phản hồi không block.
+    """
+    if ser and ser.is_open:
+        full_command = command + "\n"
+        ser.write(full_command.encode('utf-8'))
+        logging.info(f"Đã gửi lệnh: {command}")
+
+        if wait_response:
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                if ser.in_waiting > 0:
+                    response = ser.readline().decode('utf-8').strip()
+                    logging.info(f"Nhận phản hồi: {response}")
+                    if (command == "RUN_SERVO1" and response == "SERVO1_DONE") or \
+                       (command == "RUN_SERVO2" and response == "SERVO2_DONE"):
+                        return True
+                time.sleep(0.05)
+    return False
+
+def serial_read_thread(ser, model, reader, output_file):
+    """
+    Thread đọc serial không block, xử lý lệnh từ ESP32.
+    """
+    buffer = ""
+    valid_commands = {"CAR_ENTRY", "CAR_EXIT", "SERVO1_DONE", "SERVO2_DONE"}
+
+    while True:
+        try:
+            if ser.in_waiting > 0:
+                data = ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
+                buffer += data
+
+                # Tách từng dòng
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    command = line.strip()
+                    if command in valid_commands:
+                        print(f"Nhận tín hiệu từ ESP32: {command}")
+                        if command == "CAR_ENTRY":
+                            logging.info("Kích hoạt camera 1 cho xe vào")
+                            threading.Thread(target=detect_license_plate,
+                                             args=(1, ser, output_file, True, model, reader),
+                                             daemon=True).start()
+                        elif command == "CAR_EXIT":
+                            logging.info("Kích hoạt camera 0 cho xe ra")
+                            threading.Thread(target=detect_license_plate,
+                                             args=(0, ser, output_file, False, model, reader),
+                                             daemon=True).start()
+                        # Bỏ qua SERVO_DONE
+                    else:
+                        logging.warning(f"Lệnh không hợp lệ hoặc lỗi: {command}")
+            else:
+                time.sleep(0.05)
+
+        except serial.SerialException as e:
+            logging.error(f"Lỗi giao tiếp Serial: {e}")
+            break
+        except UnicodeDecodeError as e:
+            logging.error(f"Lỗi giải mã dữ liệu Serial: {e}")
+            # Không dừng thread, chỉ bỏ qua lỗi
+
+def main():
+    output_file_path = "license_plates.txt"
+    serial_port = "COM3"
+    baud_rate = 115200
+    model_path = r"C:\Users\ADMIN\Do_an1\runs\detect\train\weights\best.pt"
+
+    if not os.path.exists(model_path):
+        logging.error("Không tìm thấy file mô hình YOLO")
+        print("Không tìm thấy file mô hình YOLO")
+        return
+
+    model = YOLO(model_path)
+    reader = easyocr.Reader(['en', 'vi'])
+
+    try:
+        ser = serial.Serial(serial_port, baud_rate, timeout=0)
+        time.sleep(2)
+    except serial.SerialException as e:
+        logging.error(f"Lỗi kết nối Serial: {e}")
+        print(f"Lỗi kết nối Serial: {e}")
+        return
+
+    with open(output_file_path, 'a', encoding='utf-8') as output_file:
+        logging.info("Hệ thống khởi động, chờ tín hiệu từ ESP32...")
+        print("Hệ thống khởi động, chờ tín hiệu từ ESP32...")
+
+        # Thread đọc Serial liên tục
+        thread = threading.Thread(target=serial_read_thread, args=(ser, model, reader, output_file), daemon=True)
+        thread.start()
+
+        try:
+            while True:
+                time.sleep(1)  # giữ main thread
+        except KeyboardInterrupt:
+            print("Dừng chương trình bởi người dùng")
+
+    ser.close()
+
+if __name__ == "__main__":
+    main()
